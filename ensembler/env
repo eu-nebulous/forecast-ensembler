@@ -1,0 +1,9 @@
+AMQ_HOST=localhost
+AMQ_USER=admin
+AMQ_PASSWORD=admin
+APP_NAME=demo
+AMQ_PORT_BROKER=61613
+START_TOPIC=start_ensembler
+TZ=Europe/Vienna
+LOGING_FILE_NAME=ensembler
+
