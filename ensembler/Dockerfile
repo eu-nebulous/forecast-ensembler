@@ -3,7 +3,7 @@ FROM python:3.8-slim-buster
 # Install Python dependencies.
 WORKDIR /wd
 
-COPY deployment/ensembler/poetry.lock deployment/ensembler/pyproject.toml /wd/
+COPY /ensembler/poetry.lock /ensembler/pyproject.toml /wd/
 
 RUN apt-get update && apt-get install -y build-essential g++ libgl1-mesa-glx libx11-6 \ 
     && pip install --no-cache-dir --upgrade pip \
