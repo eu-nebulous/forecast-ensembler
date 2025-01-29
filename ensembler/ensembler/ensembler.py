@@ -1,78 +1,211 @@
-"""Script for ensembler class, currenntly 
-3 types of ensembling models are available:
-    * Mean ensembler
-    * Linnear programming
-    * Top k on last n
+"""Script for Ensembler class.
+Handles three types of ensembling models:
+    * Mean Ensembler
+    * Best Subset Ensembler
+    * Linear Programming Ensembler
 """
-
 import json
 import logging
-import threading
 import time
-from typing import List
+from typing import List, Any, Dict
 
-import stomp
-from slugify import slugify
-
+import pandas as pd
 from ensembler.dataset.data import PredictionsDF
 from ensembler.dataset.download_data import InfluxDataDownloader
 from ensembler.mocking.helpers import mock_predictions_df
-from ensembler.models.ensembler_models import (
-    AverageEnsembler,
-    BestSubsetEnsembler,
-    LinnearProgrammingEnsembler,
-)
+from ensembler.models.ensembler_models import AverageEnsembler, BestSubsetEnsembler, LinnearProgrammingEnsembler
+
+from ensembler.publisher import Publisher
+from pydantic import ValidationError
+
+from ensembler.messages_schemas import EnsembleResponse
 
 
-class Ensembler(stomp.ConnectionListener):
-    """Custom listener, parameters:
-    - conn (stomp connector)"""
+class Ensembler:
+    """Custom listener, parameters."""
 
-    def __init__(self, conn):
-        self.conn = conn
-        self.publish_rate = None
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize Ensembler with configuration.
+
+        Args:
+            config: Configuration object (a dict).
+        """
+        self.config = config
         self.metrics = None
         self.forecasters_names = None
         self.ensemblers = {}
         self.prediction_dfs = {}
-        self.metrics_frequency = {}
         self.predictions_tables_names = None
         self.influx_data_dwonloader = InfluxDataDownloader()
+        self.publishers = {}  # Store Publisher instances for each (app_id -> topic)
 
-    def get_data(self, metric: str, columns: List[str], mock: bool = True) -> None:
-        """Download data frame with predictions and real
-        values for given metric,
-        currently mocked.
-
-        Args:
-        -----
-            metric (str): metric name
-            columns (List[str]): list of columns
+    def get_or_create_publisher(self, app_id: str, topic: str) -> Publisher:
         """
-        if mock:
-            if not self.prediction_dfs[metric]:
-                self.prediction_dfs[metric] = PredictionsDF(
-                    mock_predictions_df(columns)
-                )
-            else:
-                self.prediction_dfs[metric].update(mock_predictions_df(columns))
+        Retrieve or create a Publisher for (app_id, topic).
+        Must pass 'address=topic' and 'topic=True' to fix the 'NoneType' error.
+        """
+        if app_id not in self.publishers:
+            self.publishers[app_id] = {}
 
+        if topic not in self.publishers[app_id]:
+            self.publishers[app_id][topic] = Publisher(
+                name=f"Publisher_{app_id}_{topic}",
+                address=topic,   # JMS/AMQP topic name
+                topic=True       # Tells EXN it's a topic
+            )
+            logging.info(f"Created new Publisher for app_id={app_id}, topic={topic}.")
+
+        return self.publishers[app_id][topic]
+
+    def get_data(self, app_id: str, metric: str, columns: List[str], mock: bool = False):
+        """
+        Download or mock data, then store/update in self.prediction_dfs[app_id][metric].
+        """
+        if app_id not in self.prediction_dfs:
+            self.prediction_dfs[app_id] = {}
+
+        if metric not in self.prediction_dfs[app_id]:
+            self.prediction_dfs[app_id][metric] = None
+
+        # Fetch new data
+        new_data = mock_predictions_df(columns) if mock \
+            else self.influx_data_dwonloader.download_data(app_id, metric)
+
+        # Convert to a DataFrame if needed
+        if isinstance(new_data, PredictionsDF):
+            new_data_df = new_data.df
         else:
-            if not self.prediction_dfs[metric]:
-                self.prediction_dfs[metric] = PredictionsDF(
-                    self.influx_data_dwonloader.download_data(
-                        metric, self.metrics_frequency[metric]
-                    )
-                )
-            else:
-                self.prediction_dfs[metric].update(
-                    self.influx_data_dwonloader.download_data(
-                        metric, self.metrics_frequency[metric]
-                    )
-                )
+            new_data_df = pd.DataFrame(new_data) if isinstance(new_data, list) else new_data
 
-    def get_predictions_fields(self) -> None:
-        """Get predictions columns names"""
+        if self.prediction_dfs[app_id][metric] is None:
+            # Wrap first usage
+            self.prediction_dfs[app_id][metric] = PredictionsDF(new_data_df)
+        else:
+            # Update the existing PredictionsDF
+            self.prediction_dfs[app_id][metric].update(new_data_df)
+
+    def on_start_ensembler(self, body: Dict[str, Any], app_id: str):
+        """
+        Initialize ensemblers for a specific app_id.
+        Expects body to contain "metrics" (list of dicts) and "models" (list).
+        """
+        self.metrics = [metric_info["metric"] for metric_info in body["metrics"]]
+        self.forecasters_names = body["models"]
+        self.get_predictions_fields()
+
+        if app_id not in self.ensemblers:
+            self.ensemblers[app_id] = {}
+
+        self.ensemblers[app_id] = {
+            metric: {
+                "Average": AverageEnsembler(True, self.forecasters_names),
+                "BestSubset": BestSubsetEnsembler(False, self.forecasters_names),
+                "Linear_programming": LinnearProgrammingEnsembler(False, self.forecasters_names),
+            }
+            for metric in self.metrics
+        }
+
+        # Initialize an empty PredictionsDF for each metric
+        self.prediction_dfs[app_id] = {
+            metric: PredictionsDF([]) for metric in self.metrics
+        }
+
+    def on_ensemble(self, body: Dict[str, Any]):
+        """
+        Perform ensembling for a single request:
+          - body must include {"metric", "method", "app_id", "predictionTime", ...}
+        """
+        metric = body["metric"]
+        method = body["method"]
+        app_id = body["app_id"]
+        topic = f"ensembled.{app_id}.{metric}"
+
+        # If no ensemblers for this app, attempt to initialize
+        if app_id not in self.ensemblers:
+            logging.warning(f"Ensemblers not found for app_id: {app_id}. Initializing...")
+            if "metrics" in body and "models" in body:
+                self.on_start_ensembler(body, app_id)
+            else:
+                raise KeyError(f"Missing initialization data for app_id: {app_id}")
+
+        # Confirm we have the requested metric/method
+        if metric not in self.ensemblers[app_id]:
+            raise KeyError(f"Metric '{metric}' not initialized for app_id: {app_id}")
+        if method not in self.ensemblers[app_id][metric]:
+            raise KeyError(f"Method '{method}' not initialized for app_id: {app_id}, metric: {metric}")
+
+        # Retrieve the specific ensembler
+        ensembler = self.ensemblers[app_id][metric][method]
+
+        # Possibly train the model if needed
+        if ensembler.available:
+            # "Average" typically doesn't need training
+            if method != "Average":
+                self.get_data(app_id, metric, self.predictions_tables_names[metric])
+                ensembler.train(self.prediction_dfs[app_id][metric])
+            prediction = ensembler.predict(body)
+        else:
+            # If not available, fetch data, train, see if it becomes available
+            self.get_data(app_id, metric, self.predictions_tables_names[metric])
+            ensembler.train(self.prediction_dfs[app_id][metric])
+            if ensembler.available:
+                prediction = ensembler.predict(body)
+            else:
+                # fallback to "Average"
+                logging.info(
+                    f"Ensembler for app_id: {app_id}, metric: {metric} not available. "
+                    f"Returning average prediction instead."
+                )
+                prediction = self.ensemblers[app_id][metric]["Average"].predict(body)
+
+        # Build the dictionary with the numeric fields
+        # "ensembledValue" is your final prediction
+        # "timestamp" is "now" in seconds
+        # "predictionTime" is from the request
+        ensembling_msg = {
+            "ensembledValue": prediction,
+            "timestamp": int(time.time()),
+            "predictionTime": body["predictionTime"],
+        }
+
+        # We also set up 'status' and 'data' to match our model exactly
+        # For 'data', pass any extra debugging, raw body, etc. as a dict
+
+
+        try:
+            # Create a final validated response
+            final_response = EnsembleResponse(
+                status="success",
+                **ensembling_msg     # merges in ensembledValue, timestamp, predictionTime
+            )
+            logging.info(final_response)
+        except ValidationError as exc:
+            logging.error(f"Validation error creating EnsembleResponse: {exc}")
+            raise
+
+        # Publish to ActiveMQ / EXN
+        # self.send_ensembled_prediction(app_id, topic, final_response.dict())
+
+        # Return the Pydantic model instance
+        logging.info(final_response)
+        return final_response
+
+    def send_ensembled_prediction(self, app_id: str, topic: str, msg: dict):
+        """
+        Send the final ensemble prediction to ActiveMQ.
+        """
+        try:
+            publisher = self.get_or_create_publisher(app_id, topic)
+            publisher.send_message(msg, application=topic)
+        except Exception as e:
+            logging.error(f"Failed to send ensembled prediction to '{topic}': {e}")
+
+    def get_predictions_fields(self):
+        """
+        Build a dict of metric -> list of forecaster-based column names,
+        e.g., 'metric.LSTM.prediction'.
+        """
         self.predictions_tables_names = {
             metric: [
                 f"{metric}.{forecaster}.prediction"
@@ -80,117 +213,3 @@ class Ensembler(stomp.ConnectionListener):
             ]
             for metric in self.metrics
         }
-
-    def on_error(self, frame):
-        """On message error"""
-        print(f"received an error {frame.body}")
-
-    def on_start_ensembler(self, body):
-        """Get predicted metrics, methods, frequency"""
-        self.metrics = [metric["metric"] for metric in body["metrics"]]
-        self.forecasters_names = body["models"]
-        self.get_predictions_fields()
-        self.metrics_frequency = {
-            metric_dict["metric"]: metric_dict["publish_rate"]
-            for metric_dict in body["metrics"]
-        }
-        self.ensemblers = {
-            metric: {
-                "Average": AverageEnsembler(True, self.forecasters_names),
-                "BestSubset": BestSubsetEnsembler(False, self.forecasters_names),
-                "Linnear_programming": LinnearProgrammingEnsembler(
-                    False, self.forecasters_names
-                ),
-            }
-            for metric in self.metrics
-        }
-        self.prediction_dfs = {metric: None for metric in self.metrics}
-
-    def on_ensemble(self, body):
-        """On ensemble message"""
-        ensembler = self.ensemblers[body["metric"]][body["method"]]
-        if ensembler.available:
-            if body["method"] != "Average":
-                if (
-                    int(time.time()) - ensembler.last_update_time
-                    > self.metrics_frequency[body["metric"]] // 1000
-                ):
-                    self.get_data(
-                        body["metric"], self.predictions_tables_names[body["metric"]]
-                    )
-                    ensembler.train(self.prediction_dfs[body["metric"]])
-            prediction = ensembler.predict(body)
-        else:
-            self.get_data(body["metric"], self.predictions_tables_names[body["metric"]])
-            ensembler.train(self.prediction_dfs[body["metric"]])
-            if ensembler.available:
-                prediction = ensembler.predict(body)
-            else:
-                print("Ensembler not available returning average prediction insetad")
-                logging.info(
-                    "Ensembler not available returning average prediction insetad"
-                )
-                prediction = self.ensemblers[body["metric"]["Average"]].predict(body)
-
-        ensembling_msg = self.create_msg(prediction, body["predictionTime"])
-        return ensembling_msg
-        # self.send_ensembled_prediction(ensembling_msg, f"ensembled.{body['metric']}")
-
-    @staticmethod
-    def is_topic(headers, event):
-        """Check is topic"""
-        if not hasattr(event, "_match"):
-            return False
-        match = getattr(event, "_match")
-        return headers.get("destination").startswith(match)
-
-    @staticmethod
-    def has_topic_name(headers, string):
-        """Check topic name"""
-        return headers.get("destination").startswith(string)
-
-    @staticmethod
-    def get_topic_name(headers):
-        """Get topic name"""
-        return headers.get("destination").replace("/topic/", "")
-
-    def on_message(self, frame):
-        """On any message, runs 'on_[MESSAGE NAME]'"""
-        body = json.loads(frame.body)
-        headers = frame.headers
-        topic_name = slugify(
-            headers.get("destination").replace("/topic/", ""),
-            separator="_",
-        )
-        func_name = f"on_{topic_name}"
-        if hasattr(self, func_name):
-            func = getattr(self, func_name)
-            func(body)
-        else:
-            print(f"Unknonw topic name: {topic_name}")
-
-    @staticmethod
-    def create_msg(prediction, prediction_time):
-        """Create message with ensembled prediction and prediction time"""
-        msg = {
-            "ensembledValue": prediction,
-            "timestamp": int(time.time()),
-            "predictionTime": prediction_time,
-        }
-
-        return msg
-
-    def send_ensembled_prediction(self, msg, dest):
-        """Send prediction via ActiveMQ"""
-        self.conn.send_to_topic(dest, msg)
-
-    def train_ensembling_methods(self):
-        """Train esnembling methods (which require time consuming training)"""
-        print(self.forecasters_names)
-        print("trainig ensemblers!")
-
-    def run_ensemblers_training(self):
-        """Run ensemblers training (in sepparate thread)"""
-        training_thread = threading.Thread(target=self.train_ensembling_methods)
-        training_thread.start()
-        training_thread.join()

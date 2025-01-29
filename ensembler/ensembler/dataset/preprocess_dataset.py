@@ -8,16 +8,12 @@ from pytorch_forecasting.data import NaNLabelEncoder
 
 pd.options.mode.chained_assignment = None
 
-"""Script for preparing time series dataset from pythorch-forecasting package 
-TODO: add checking whether data consists of multiple series, handle nans values"""
-
-
 class Dataset(object):
     def __init__(
         self,
         dataset,
         target_column="value",
-        time_column="ems_time",
+        time_column="_time",
         tv_unknown_reals=[],
         known_reals=[],
         tv_unknown_cat=[],
@@ -25,12 +21,8 @@ class Dataset(object):
         classification=0,
         context_length=40,
         prediction_length=5,
-        publish_rate=10000,
     ):
-
-        self.max_missing_values = (
-            20  # max consecutive missing values allowed per series
-        )
+        self.max_missing_values = 20  # max consecutive missing values allowed per series
         self.target_column = target_column
         self.time_column = time_column
         self.tv_unknown_cat = tv_unknown_cat
@@ -40,7 +32,7 @@ class Dataset(object):
         self.classification = classification
         self.context_length = context_length
         self.prediction_length = prediction_length
-        self.publish_rate = publish_rate
+
         self.dataset = dataset
         self.dropped_recent_series = True  # default set to be true
         if self.dataset.shape[0] > 0:
@@ -52,10 +44,9 @@ class Dataset(object):
     def cut_nan_start(self, dataset):
         dataset.index = range(dataset.shape[0])
         first_not_nan_index = dataset[self.target_column].first_valid_index()
-        if first_not_nan_index == first_not_nan_index:  # check is if it;s not np.nan
-            if first_not_nan_index is not None:
-                if first_not_nan_index > -1:
-                    return dataset[dataset.index > first_not_nan_index]
+        if first_not_nan_index == first_not_nan_index:  # check if not np.nan
+            if first_not_nan_index is not None and first_not_nan_index > -1:
+                return dataset[dataset.index > first_not_nan_index]
         else:
             return dataset.dropna()
 
@@ -91,7 +82,7 @@ class Dataset(object):
 
     def add_obligatory_columns(self, dataset):
         n = dataset.shape[0]
-        dataset["time_idx"] = range(n)  # TODO check time gaps
+        dataset["time_idx"] = range(n)  # create a zero-based time index
         return dataset
 
     def get_time_difference_current(self):
@@ -122,29 +113,22 @@ class Dataset(object):
                     f"Metric: {self.target_column} Max time gap in series {max_gap}"
                 )
                 print(f" Metric: {self.target_column} Max time gap in series {max_gap}")
-                series_freq = (
-                    (self.dataset[self.time_column])
-                    .diff()
-                    .fillna(0)
-                    .value_counts()
-                    .index.values[0]
-                )
+
+                # Determine the most common frequency from the data
+                time_diffs = self.dataset[self.time_column].diff().fillna(0)
+                if time_diffs.shape[0] > 0:
+                    series_freq = time_diffs.value_counts().index.values[0]
+                else:
+                    # fallback if no diffs
+                    series_freq = 1
 
                 logging.info(
-                    f"Metric: {self.target_column} Detected series with {series_freq} frequency"
+                    f"Metric: {self.target_column} Detected series frequency: {series_freq}"
                 )
-                print(
-                    f"Metric: {self.target_column} Detected series with {series_freq} frequency"
-                )
-                if series_freq != self.publish_rate:
-                    logging.info(
-                        f"Metric: {self.target_column} Detected series with {series_freq} frequency, but the frequency should be: {self.publish_rate}!"
-                    )
-                    print(
-                        f"Metric: {self.target_column} Detected series with {series_freq} frequency, but the frequency should be: {self.publish_rate}!"
-                    )
+                print(f"Metric: {self.target_column} Detected series frequency: {series_freq}")
 
-                # check series length
+                # Split series based on large gaps using the frequency-based threshold
+                gap_threshold = np.abs(self.max_missing_values * series_freq)
                 series = np.split(
                     self.dataset,
                     *np.where(
@@ -153,7 +137,7 @@ class Dataset(object):
                         .abs()
                         .fillna(0)
                         .astype(int)
-                        >= np.abs(self.max_missing_values * self.publish_rate)
+                        >= gap_threshold
                     ),
                 )
                 logging.info(f"Metric: {self.target_column} {len(series)} series found")
@@ -180,7 +164,7 @@ class Dataset(object):
                     f"Metric: {self.target_column} {len(preprocessed_series)} long enough series found"
                 )
                 print(f"{len(preprocessed_series)} long enough series found")
-                # logging.info(f"")
+
                 if preprocessed_series:
                     self.dataset = pd.concat(preprocessed_series)
                     if self.dataset["series"].max() != len(series) - 1:
@@ -214,15 +198,11 @@ class Dataset(object):
 
     def create_time_series_dataset(self):
         if not self.classification:
-            self.time_varying_unknown_reals = [
-                self.target_column
-            ] + self.tv_unknown_reals
+            self.time_varying_unknown_reals = [self.target_column] + self.tv_unknown_reals
             self.time_varying_unknown_categoricals = self.tv_unknown_cat
         else:
             self.time_varying_unknown_reals = self.tv_unknown_reals
-            self.time_varying_unknown_categoricals = [
-                self.target_column
-            ] + self.tv_unknown_cat
+            self.time_varying_unknown_categoricals = [self.target_column] + self.tv_unknown_cat
 
         ts_dataset = TimeSeriesDataSet(
             self.dataset[lambda x: x.split == "train"],

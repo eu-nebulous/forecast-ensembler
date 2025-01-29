@@ -2,7 +2,7 @@
 be passed to a model, and after parsing and validation pydantic
 guarantees that the fields of the resultant model instance will
 conform to the field types defined on the model. """
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 # pylint: disable=no-name-in-module
 from pydantic import BaseModel
@@ -23,18 +23,23 @@ class Prediction(BaseModel):
     predictionsToEnsemble: Dict[
         str,
         Optional[float],
-    ]
+    ] #method_name exmp lstm and value
+    app_id: str
+
 
 
 class EnsembleResponse(BaseModel):
-    """Ensemble response message body
-    metricValue: float, ensembled prediction
-    timestamp: int, ensembled prediction creation time in seconds
-    predictiontime: int, prediction time in seconds"""
-
+    """
+    Pydantic response model with these required fields:
+        - status: e.g. "success"
+        - data:   any dict with additional info
+        - ensembledValue: final numeric prediction
+        - timestamp: creation time in seconds
+        - predictionTime: original prediction time (from request)"""
+    status: str
+    data: Optional[Dict[str, Any]] = None
     ensembledValue: float
     timestamp: int
     predictionTime: int
-
 
 # pylint: enable=too-few-public-methods

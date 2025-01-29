@@ -34,11 +34,12 @@ RUN mkdir -p /var/lib/morphemic && \
     rm -rf /var/lib/morphemic
 
 # Copy the rest of the application code
-COPY ensembler/ /wd/
+COPY app.py /wd/app.py
+COPY ensembler /wd/ensembler
 
+ENV PYTHONPATH="/wd"
 # Set the default command to run the application
 CMD ["poetry", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-
 # Uncomment for local testing with live reload
 # CMD ["poetry", "run", "uvicorn", "app:app", "--reload"]
 

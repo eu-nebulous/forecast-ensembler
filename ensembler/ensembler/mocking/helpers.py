@@ -25,8 +25,8 @@ start_ens_header = {
 }
 start_ens_body = {
     "metrics": [
-        {"metric": "MaxCPULoad", "level": 3, "publish_rate": 60000},
-        {"metric": "MinCPULoad", "level": 3, "publish_rate": 50000},
+        {"metric": "MaxCPULoad", "level": 3},
+        {"metric": "MinCPULoad", "level": 3},
     ],
     "models": ["tft", "nbeats", "gluon"],
 }

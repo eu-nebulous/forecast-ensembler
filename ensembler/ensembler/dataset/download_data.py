@@ -1,116 +1,147 @@
-"""Script for downloading data from influx
-"""
-
+import logging
 import os
-
 import pandas as pd
-from influxdb import DataFrameClient
+from influxdb_client import InfluxDBClient, QueryApi
+
+from ensembler.dataset.data import PredictionsDF
 
 
 class InfluxDataDownloader:
-    def __init__(
-        self,
-    ) -> None:
-        """class for downloading data from inlux,
-        necessary are columns with predictions and
-        real values
-        """
-
-        self.influx_client = DataFrameClient(
-            host=os.environ.get("INFLUXDB_HOSTNAME", "localhost"),
-            port=int(os.environ.get("INFLUXDB_PORT", "8086")),
-            username=os.environ.get("INFLUXDB_USERNAME", "morphemic"),
-            password=os.environ.get("INFLUXDB_PASSWORD", "password"),
+    def __init__(self) -> None:
+        """Initialize the InfluxDB client."""
+        self.client = InfluxDBClient(
+            url=f"http://{os.environ.get('INFLUXDB_HOSTNAME', 'nebulous-influxdb')}:{os.environ.get('INFLUXDB_PORT', '8086')}",
+            token=os.environ.get("INFLUXDB_TOKEN", "my-super-secret-auth-token"),
+            org=os.environ.get("INFLUXDB_ORG", "my-org"),
+            username=os.environ.get("INFLUXDB_USERNAME", "my-user"),
+            password=os.environ.get("INFLUXDB_PASSWORD", "my-password"),
         )
-        self.influx_client.switch_database(
-            os.environ.get("INFLUXDB_DBNAME", "morphemic")
-        )
+        self.query_api: QueryApi = self.client.query_api()
 
     @staticmethod
     def convert_timestamp(data_frame: pd.DataFrame) -> pd.DataFrame:
-        """convert date index to desired format
-
-        Args:
-        -------
-            data_frame (pd.DataFrame): data frame with
-            time index (pandas time index)
-
-        Returns:
-        -------
-            pd.DataFrame: data frame with date index
-            with desired format
         """
-        return pd.to_datetime(data_frame.index, unit="s").tz_convert(None)
-
-    def download_predictions(self, metric_name: str) -> pd.DataFrame:
-        """Download predicted values from influx
-
-        Returns:
-        -------
-            pd.DataFrame: pandas data
-             frame with predictions values
+        Convert the index of the DataFrame to UTC (if it's a DateTimeIndex)
+        and remove the timezone information.
         """
-        return self.influx_client.query(
-            f'SELECT * FROM "{metric_name}Predictions" WHERE time > now() - {os.environ.get("MAX_PAST_DAYS", 100)}d'
-        )[f"{metric_name}Predictions"]
+        if not isinstance(data_frame.index, pd.DatetimeIndex):
+            data_frame.index = pd.to_datetime(data_frame.index)
+        return data_frame.tz_localize(None)
 
-    def download_real(self, start_time: pd.DatetimeIndex) -> pd.DataFrame:
-        """Download real values from influx
+    def download_predictions(self, app_id: str, metric_name: str) -> pd.DataFrame:
+        bucket_name = f"nebulous_{app_id}_predicted_bucket"
+        flux_query = f'''
+            from(bucket: "{bucket_name}")
+                |> range(start: -{os.environ.get("MAX_PAST_DAYS", "100")}d)
+                |> filter(fn: (r) => r["_measurement"] == "{metric_name}")
+                |> filter(fn: (r) => r["_field"] == "metricValue")
+        '''
+        result = self.query_api.query_data_frame(flux_query)
 
-        Args:
-        -------
-            start_time (pd.DatetimeIndex): first
-            date with predictions,
+        # If result is a list of DataFrames, concatenate them
+        if isinstance(result, list):
+            if not result:
+                raise ValueError(...)
+            df = pd.concat(result, ignore_index=False)
+        else:
+            df = result
 
-        Returns:
-        -------
-            pd.DataFrame: pandas data
-             frame with real values from PS
+        # Check emptiness
+        if df.empty:
+            raise ValueError(...)
+
+        # Convert the _time column to datetime and set as index
+        df["_time"] = pd.to_datetime(df["_time"], errors="coerce")
+        df = df.set_index("_time").sort_index()
+
+        # -----------------------------------------------------
+        #  **Pivot** so that each `forecaster` => separate column
+        # -----------------------------------------------------
+        # Currently, df has "forecaster" as a column, and _value as numeric predictions.
+        # We'll pivot to get wide columns for each forecaster
+        df = df.pivot_table(
+            index=df.index,  # Use the already-set _time index
+            columns="forecaster",  # Pivot on forecaster names
+            values="_value",  # The numeric predictions
+            aggfunc="first"  # If duplicates, just take the first (or mean)
+        )
+
+        # Now we have columns = forecaster names
+        # We'll rename them so they end with ".prediction"
+        df = df.add_suffix(".prediction")
+
+        # Prepend the metric_name, e.g. "AccumulatedSecondsPendingRequests.lstm.prediction"
+        df = df.rename(
+            columns=lambda col: f"{metric_name}.{col}" if col.endswith(".prediction") else col
+        )
+        return df
+
+    def download_real(self, app_id: str, metric_name: str, start_time: str) -> pd.DataFrame:
         """
-        return self.influx_client.query(
-            f'SELECT * FROM "{os.environ.get("APP_NAME", "default_application")}" WHERE time > {start_time}'
-        )[os.environ.get("APP_NAME", "default_application")]
-
-    def download_data(self, metric_name: str, predictions_freq: int) -> pd.DataFrame:
+        Download real values for a specific app_id starting from a specific time.
         """
-        Download data from inlux
-        (2 tables one with predictions, second with
-        real values from PS), merge data and save them to csv
+        bucket_name = f"nebulous_{app_id}_bucket"
+        flux_query = f'''
+            from(bucket: "{bucket_name}")
+            |> range(start: time(v: "{start_time}"))
+            |> filter(fn: (r) => r["_measurement"] == "{metric_name}")
+            |> filter(fn: (r) => r["_field"] == "metricValue")
+        '''
+        result = self.query_api.query_data_frame(flux_query)
 
-        Args:
-        ------
-            metric_name (str): metric name
-            predictions_freq (int): predictions
-            frequency (in seconds)
+        if result.empty:
+            raise ValueError(
+                f"No real data found for app_id: {app_id} starting at {start_time}"
+            )
 
-        Returns:
-        -------
-            pd.DataFrame: pandas data
-             frame with real and predicted values
+        df = result.set_index("_time").sort_index()
+        return df
+
+    def download_data(self, app_id: str, metric_name: str) -> PredictionsDF:
         """
-        predictions = self.download_predictions(metric_name)
+        Download and merge prediction and real values
+        for a specific app_id and metric.
+        """
+        # 1. Download predictions
+        predictions = self.download_predictions(app_id, metric_name)
+        predictions.index = pd.to_datetime(predictions.index, errors="coerce")
         predictions = self.convert_timestamp(predictions)
-        start_time = predictions.index.values[0]
 
-        real = self.download_data(start_time)
-        real.index = real["ems_time"]
+        # --- Rename the predictions column so it ends with ".prediction" ---
+        # For example, if metric_name = "cpu", it becomes "cpu.Forecaster.prediction"
+        # so the ensemblers can match columns ending in ".prediction".
+
+
+        if predictions.index.empty:
+            raise ValueError(
+                f"No valid timestamps in predictions for {app_id}, {metric_name}"
+            )
+
+        # Convert earliest timestamp to ISO 8601 with 'Z' for UTC
+        start_time = predictions.index[0].isoformat() + "Z"
+
+        # 2. Download real data from start_time
+        real = self.download_real(app_id, metric_name, start_time)
+        real.index = pd.to_datetime(real.index, errors="coerce")
         real = self.convert_timestamp(real)
 
-        predictions = predictions.resample(
-            f"{predictions_freq}S", origin=start_time
-        ).mean()
-        real = (
-            real.resample(f"{predictions_freq}S", origin=start_time)
-            .mean()
-            .rename({metric_name: "y"}, axis=1)
-        )["y"]
+        logging.info(
+            f"[{app_id}:{metric_name}] Downloaded real: {real.shape[0]} rows"
+        )
 
-        merged = pd.merge(
-            predictions,
-            real,
-            how="left",
-            left_index=True,
-            right_index=True,
-        ).dropna(subset=["y"])
+        # Rename the real column from _value to "y"
+        real.rename(columns={"_value": "y"}, inplace=True)
 
-        return merged
+        # 3. Merge predictions and real data on timestamp
+        merged = pd.merge(predictions, real, how="left", left_index=True, right_index=True)
+        logging.info(
+            f"[{app_id}:{metric_name}] Merged data shape before dropna: {merged.shape}"
+        )
+
+        # Drop rows where real data (y) is missing
+        merged.dropna(subset=["y"], inplace=True)
+        logging.info(
+            f"[{app_id}:{metric_name}] Merged data shape after dropna: {merged.shape}"
+        )
+
+        return PredictionsDF(merged, target_column="y")
