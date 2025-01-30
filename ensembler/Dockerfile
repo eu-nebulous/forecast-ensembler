@@ -1,28 +1,38 @@
-FROM python:3.8-slim-buster
+FROM python:3.8-slim-bullseye
 
-# Set the working directory
+# Best practice: do noninteractive for apt
+ENV DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /wd
 
-# Copy Poetry configuration files
-COPY poetry.lock pyproject.toml /wd/
+# Copy Poetry files first (for caching layers)
+COPY pyproject.toml poetry.lock /wd/
 
-# Install system dependencies and Python tools
+# Install system dependencies, update pip, install Poetry
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        g++ \
-        libgl1-mesa-glx \
-        libx11-6 \
-        curl \
+    build-essential \
+    g++ \
+    libgl1-mesa-glx \
+    libx11-6 \
+    curl \
     && pip install --no-cache-dir --upgrade pip --root-user-action=ignore \
     && pip install --no-cache-dir poetry \
-    && poetry config virtualenvs.create false \
-    && poetry install --only main \
+    && pip install --no-cache-dir grpcio \
+    && pip install --no-cache-dir python-qpid-proton \
+    && poetry config virtualenvs.create false
+
+# --- Add this step so Poetry can see your local exn/ directory ---
+COPY exn /wd/exn
+COPY ensembler /wd/ensembler
+COPY app.py /wd/app.py
+
+# Now install all dependencies, including the local exn path dependency
+RUN poetry install --only main \
     && mkdir -p /wd/models /wd/logs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and extract the morphemic-preprocessor tarball
-# Create the directory and download the morphemic-preprocessor tarball
+# Download / install your custom tarball (morphemic-preprocessor, etc.)
 RUN mkdir -p /var/lib/morphemic && \
     curl -L -o /var/lib/morphemic/morphemic-preprocessor-morphemic-rc4.0.tar.gz \
         https://gitlab.ow2.org/melodic/morphemic-preprocessor/-/archive/morphemic-rc4.0/morphemic-preprocessor-morphemic-rc4.0.tar.gz && \
@@ -33,13 +43,6 @@ RUN mkdir -p /var/lib/morphemic && \
     cp -R /var/lib/morphemic/morphemic-preprocessor-morphemic-rc4.0/amq-message-python-library /wd/amq_message_python_library && \
     rm -rf /var/lib/morphemic
 
-# Copy the rest of the application code
-COPY app.py /wd/app.py
-COPY ensembler /wd/ensembler
-
 ENV PYTHONPATH="/wd"
-# Set the default command to run the application
-CMD ["poetry", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-# Uncomment for local testing with live reload
-# CMD ["poetry", "run", "uvicorn", "app:app", "--reload"]
 
+CMD ["poetry", "run", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
