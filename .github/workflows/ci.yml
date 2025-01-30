@@ -9,10 +9,10 @@ on:
       - main
       - r[1-9]
 jobs:
-  build-and-push-nebulous-forecast-ensembler:
+  build-and-push-forecast-ensembler:
     name: Build and push forecast-ensembler
     uses: eu-nebulous/github-actions/.github/workflows/build-and-push-container-image.yml@main
     with:
       context: ensembler
-      image-name: nebulous-forecast-ensembler
+      image-name: forecast-ensembler
     secrets: inherit
