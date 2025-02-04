@@ -29,6 +29,14 @@ class InfluxDataDownloader:
         return data_frame.tz_localize(None)
 
     def download_predictions(self, app_id: str, metric_name: str) -> pd.DataFrame:
+        """
+        Downloads prediction data from an InfluxDB bucket and returns it as a pivoted DataFrame.
+        Each forecaster becomes its own column, and the column names end with ".prediction".
+
+        Raises:
+            ValueError: If no DataFrames are returned or if the final DataFrame is empty.
+        """
+
         bucket_name = f"nebulous_{app_id}_predicted_bucket"
         flux_query = f'''
             from(bucket: "{bucket_name}")
@@ -36,44 +44,46 @@ class InfluxDataDownloader:
                 |> filter(fn: (r) => r["_measurement"] == "{metric_name}")
                 |> filter(fn: (r) => r["_field"] == "metricValue")
         '''
+
         result = self.query_api.query_data_frame(flux_query)
 
         # If result is a list of DataFrames, concatenate them
         if isinstance(result, list):
             if not result:
-                raise ValueError(...)
+                raise ValueError(
+                    f"No data returned for metric '{metric_name}' in bucket '{bucket_name}'."
+                )
             df = pd.concat(result, ignore_index=False)
         else:
             df = result
 
-        # Check emptiness
+        # Check if DataFrame is empty
         if df.empty:
-            raise ValueError(...)
+            raise ValueError(
+                f"InfluxDB query returned an empty DataFrame for metric '{metric_name}' in "
+                f"bucket '{bucket_name}'."
+            )
 
-        # Convert the _time column to datetime and set as index
+        # Convert the _time column to datetime and set it as the index
         df["_time"] = pd.to_datetime(df["_time"], errors="coerce")
         df = df.set_index("_time").sort_index()
 
-        # -----------------------------------------------------
-        #  **Pivot** so that each `forecaster` => separate column
-        # -----------------------------------------------------
-        # Currently, df has "forecaster" as a column, and _value as numeric predictions.
-        # We'll pivot to get wide columns for each forecaster
+        # Pivot so that each forecaster is a separate column
         df = df.pivot_table(
             index=df.index,  # Use the already-set _time index
             columns="forecaster",  # Pivot on forecaster names
-            values="_value",  # The numeric predictions
-            aggfunc="first"  # If duplicates, just take the first (or mean)
+            values="_value",  # Numeric predictions
+            aggfunc="first"  # If duplicates, just take the first (or use "mean" if preferred)
         )
 
-        # Now we have columns = forecaster names
-        # We'll rename them so they end with ".prediction"
+        # Add ".prediction" suffix to all columns
         df = df.add_suffix(".prediction")
 
-        # Prepend the metric_name, e.g. "AccumulatedSecondsPendingRequests.lstm.prediction"
+        # Prepend metric_name to each column, e.g. "AccumulatedSecondsPendingRequests.lstm.prediction"
         df = df.rename(
             columns=lambda col: f"{metric_name}.{col}" if col.endswith(".prediction") else col
         )
+
         return df
 
     def download_real(self, app_id: str, metric_name: str, start_time: str) -> pd.DataFrame:
@@ -100,24 +110,20 @@ class InfluxDataDownloader:
     def download_data(self, app_id: str, metric_name: str) -> PredictionsDF:
         """
         Download and merge prediction and real values
-        for a specific app_id and metric.
+        for a specific app_id and metric, aligning timestamps
+        with an as-of merge (nearest match).
         """
         # 1. Download predictions
         predictions = self.download_predictions(app_id, metric_name)
         predictions.index = pd.to_datetime(predictions.index, errors="coerce")
         predictions = self.convert_timestamp(predictions)
 
-        # --- Rename the predictions column so it ends with ".prediction" ---
-        # For example, if metric_name = "cpu", it becomes "cpu.Forecaster.prediction"
-        # so the ensemblers can match columns ending in ".prediction".
-
-
         if predictions.index.empty:
             raise ValueError(
                 f"No valid timestamps in predictions for {app_id}, {metric_name}"
             )
 
-        # Convert earliest timestamp to ISO 8601 with 'Z' for UTC
+        # Convert earliest prediction timestamp to ISO 8601 with 'Z' for UTC
         start_time = predictions.index[0].isoformat() + "Z"
 
         # 2. Download real data from start_time
@@ -132,13 +138,31 @@ class InfluxDataDownloader:
         # Rename the real column from _value to "y"
         real.rename(columns={"_value": "y"}, inplace=True)
 
-        # 3. Merge predictions and real data on timestamp
-        merged = pd.merge(predictions, real, how="left", left_index=True, right_index=True)
+        # 3. Use merge_asof() to align the real data to the nearest prediction timestamp
+        # Sort both DataFrames by index (time) - merge_asof requires that both are sorted
+        predictions_sorted = predictions.sort_index()
+        real_sorted = real.sort_index()
+
+        logging.info(
+            f"[{app_id}:{metric_name}] Predictions shape: {predictions_sorted.shape}, "
+            f"Real shape: {real_sorted.shape}"
+        )
+
+        # Merge “as of” the prediction timestamps, taking the nearest real data
+        # within a 5-minute tolerance (tweak this as needed).
+        merged = pd.merge_asof(
+            left=predictions_sorted,
+            right=real_sorted[["y"]],
+            left_index=True,
+            right_index=True,
+            direction="nearest",
+            tolerance=pd.Timedelta("5m")
+        )
         logging.info(
             f"[{app_id}:{metric_name}] Merged data shape before dropna: {merged.shape}"
         )
 
-        # Drop rows where real data (y) is missing
+        # Drop rows where 'y' is still missing (i.e., if no real data within tolerance)
         merged.dropna(subset=["y"], inplace=True)
         logging.info(
             f"[{app_id}:{metric_name}] Merged data shape after dropna: {merged.shape}"
